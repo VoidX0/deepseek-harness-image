@@ -1,0 +1,104 @@
+name: Docker Image CI
+on:
+  workflow_dispatch: # 允许手动触发
+  schedule:
+    - cron: "0 */6 * * *" # 每6小时检查一次
+
+env:
+  IMAGE_NAME: deepseek-harness
+  UPSTREAM_REPO: "https://github.com/deepseek-ai/deepseek-harness.git"
+  UPSTREAM_BRANCH: "master"
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Convert owner to lowercase # 转换仓库所有者
+        id: set-owner
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "OWNER=$OWNER" >> $GITHUB_ENV
+          echo "Registry owner set to: $OWNER"
+
+      - name: Get current date # 获取当前日期
+        id: date
+        run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+      - name: Log in to GitHub Container Registry # 登录到 GitHub 容器注册表
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for upstream git commit updates # 检查上游仓库是否有新提交
+        id: check
+        run: |
+          echo "Checking upstream repo: ${{ env.UPSTREAM_REPO }} on branch ${{ env.UPSTREAM_BRANCH }}"
+
+          # 获取上游仓库 master 分支最新的 Commit SHA
+          UPSTREAM_SHA=$(git ls-remote ${{ env.UPSTREAM_REPO }} refs/heads/${{ env.UPSTREAM_BRANCH }} | awk '{print $1}')
+          echo "Upstream Latest SHA: $UPSTREAM_SHA"
+          echo "upstream_sha=$UPSTREAM_SHA" >> $GITHUB_OUTPUT
+
+          # 从已有镜像的 Label 中读取上次记录的 SHA
+          MY_IMAGE="ghcr.io/${{ env.OWNER }}/${{ env.IMAGE_NAME }}:latest"
+          MY_RECORDED_SHA=$(skopeo inspect --creds "${{ github.repository_owner }}:${{ secrets.GITHUB_TOKEN }}" docker://$MY_IMAGE --format '{{.Labels.upstream_commit}}' 2>/dev/null || echo "none")
+          echo "My Recorded SHA: $MY_RECORDED_SHA"
+
+          # 对比 Commit SHA
+          if [ "$UPSTREAM_SHA" != "$MY_RECORDED_SHA" ]; then
+            echo "Updates detected! Triggering build."
+            echo "needs_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "No updates detected. Skipping build."
+            echo "needs_build=false" >> $GITHUB_OUTPUT
+          fi
+
+      # 签出当前仓库（获取 Dockerfile）
+      - name: Checkout current repository
+        if: steps.check.outputs.needs_build == 'true' || github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v4
+        with:
+          path: my-repo
+
+      # 签出上游 master 分支的最新源码
+      - name: Checkout upstream repository
+        if: steps.check.outputs.needs_build == 'true' || github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v4
+        with:
+          repository: "deepseek-ai/deepseek-harness"
+          ref: ${{ steps.check.outputs.upstream_sha }}
+          path: upstream-src
+
+      # 将 Dockerfile 拷贝至上游源码目录
+      - name: Copy Dockerfile to source directory
+        if: steps.check.outputs.needs_build == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          cp my-repo/Dockerfile upstream-src/Dockerfile
+
+      - name: Set up Docker Buildx # 设置 Docker 构建器
+        if: steps.check.outputs.needs_build == 'true' || github.event_name == 'workflow_dispatch'
+        uses: docker/setup-buildx-action@v3
+
+      # 执行多阶段构建与推送
+      - name: Build and push Docker image
+        if: steps.check.outputs.needs_build == 'true' || github.event_name == 'workflow_dispatch'
+        uses: docker/build-push-action@v5
+        with:
+          context: ./upstream-src
+          file: ./upstream-src/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ env.OWNER }}/${{ env.IMAGE_NAME }}:latest
+            ghcr.io/${{ env.OWNER }}/${{ env.IMAGE_NAME }}:${{ steps.date.outputs.date }}
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            upstream_commit=${{ steps.check.outputs.upstream_sha }}
