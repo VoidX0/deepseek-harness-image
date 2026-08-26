@@ -8,8 +8,15 @@ RUN corepack enable && corepack prepare pnpm@11.7.0 --activate
 WORKDIR /app
 
 COPY . .
+
+# 跳过 Lefthook 安装
+ENV LEFTHOOK=0
+RUN echo "process.exit(0)" > scripts/install-lefthook.mjs 2>/dev/null || true
+
+# 安装依赖
 RUN pnpm install --frozen-lockfile
 
+# 编译
 RUN pnpm run build
 
 # 生产运行阶段
