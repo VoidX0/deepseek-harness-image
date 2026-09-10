@@ -43,10 +43,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN corepack enable && corepack prepare pnpm@11.7.0 --activate
 
 COPY --from=builder /app /app
+COPY run.sh /app/run.sh
+COPY image_patches /app/image_patches
 
 ENV PORT=3080
 
 EXPOSE 3080
 
 # 启动
-CMD ["sh", "-c", "chmod 600 /root/.dsh/.credentials.yaml 2>/dev/null || true; printf ':3080 {\n  reverse_proxy 127.0.0.1:3081 {\n    header_up Host 127.0.0.1:3081\n    header_up Origin http://127.0.0.1:3081\n    header_up X-Dsh-External \"1\"\n  }\n}\n' > /etc/caddy/Caddyfile && caddy run --config /etc/caddy/Caddyfile & pnpm run dsh web --port 3081 --no-open"]
+CMD ["sh", "/app/run.sh"]

@@ -75,11 +75,13 @@ jobs:
           ref: ${{ steps.check.outputs.upstream_sha }}
           path: upstream-src
 
-      # 将 Dockerfile 拷贝至上游源码目录
-      - name: Copy Dockerfile to source directory
+      # 将需要的内容拷贝至上游源码目录
+      - name: Copy content to source directory
         if: steps.check.outputs.needs_build == 'true' || github.event_name == 'workflow_dispatch'
         run: |
           cp my-repo/Dockerfile upstream-src/Dockerfile
+          cp my-repo/run.sh upstream-src/run.sh
+          cp -r my-repo/image_patches upstream-src/image_patches
 
       - name: Set up Docker Buildx # 设置 Docker 构建器
         if: steps.check.outputs.needs_build == 'true' || github.event_name == 'workflow_dispatch'
