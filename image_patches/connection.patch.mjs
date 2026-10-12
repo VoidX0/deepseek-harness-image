@@ -1,12 +1,26 @@
 #!/usr/bin/env node
 /**
- * connection.patch.mjs —— 新版 DSH connection/BrowserAuth 适配补丁（幂等）
- * 由 start.sh 或单独调用。四个子补丁：
+ * connection.patch.mjs —— DSH connection/BrowserAuth 适配补丁（幂等）
+ * 由 run.sh 在容器启动时执行。子补丁：
  *  A. src/rpc-host.ts requestRejection：无 X-Dsh-External 放行 + DSH_WEB_AUTH=off 全放行
- *  B. src/browser-auth.ts：token 固定（env > 文件 > 内存）
- *  C. src/browser-auth.ts authorizeIndex：DSH_WEB_AUTH=off 放行 index
- *  D. lib/index.js（编译产物同步 A）
+ *  B. src/browser-auth.ts：node:fs/os/path imports、token 固定（env > 文件 > 内存）、authorizeIndex off 开关
+ *  D. lib/index.js：编译产物同步 A
  *  E. lib/client.js：客户端 isLoopback 放宽（远程可读 settings）
+ *
+ * ── 2026-10 适配 DSH 0.2.x ──────────────────────────────────────────────
+ * 上游 0.2.x 把 HostConnectionService.requestRejection 从
+ *     requestRejection(request) {
+ *       if (!isTrustedApiRequest(request, this.trustedHosts)) return 403
+ *       return this.browserAuth.isAuthenticated(request) ? undefined : 401
+ *     }
+ * 改成了带 webServer carrier 的版本（isTrustedApiRequest/isAuthenticated 都多了参数），
+ * 于是「整段函数体」的锚点必然失配，DSH_WEB_AUTH=off 没装上 → /api 全部 401
+ * （含 /api/remote.mux 的 WebSocket upgrade）→ 页面能开、但一直 “connection lost”。
+ *
+ * 现在对这类「函数签名 + 插入若干行」的补丁统一改用 **签名正则锚点**：只要函数签名还在，
+ * 函数体怎么重构都能命中；同时兼容 0.1.x（两版签名一致）。只有 B2/E 这两处整体替换
+ * 仍需精确锚点（它们在 0.2.1 已验证仍能命中）。
+ * ───────────────────────────────────────────────────────────────────────
  */
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 
@@ -18,45 +32,54 @@ const LIB_CLIENT = '/app/packages/client/connection/lib/client.js'
 let patched = 0
 let failed = 0
 
+/**
+ * 依次应用若干子补丁。每条规则二选一：
+ *   - match + insert：正则锚点，插入新行（用 $1 保留签名行）；
+ *   - oldStr + newStr：精确整段替换。
+ * mark 为幂等标记：已存在则跳过。
+ */
 function patchFile(file, patches, label) {
   if (!existsSync(file)) { console.log(`[patch] 跳过(不存在): ${file}`); return }
   let t = readFileSync(file, 'utf8')
-  for (const { mark, oldStr, newStr, name } of patches) {
+  let changed = false
+  for (const { mark, name, match, insert, oldStr, newStr } of patches) {
     if (t.includes(mark)) { console.log(`[patch] 已打(幂等跳过): ${label} · ${name}`); continue }
-    if (!t.includes(oldStr)) { console.log(`[patch] ⚠ 锚点未命中: ${label} · ${name}`); failed += 1; continue }
-    t = t.replace(oldStr, newStr)
+    if (match !== undefined) {
+      if (!match.test(t)) { console.log(`[patch] ⚠ 锚点未命中: ${label} · ${name}`); failed += 1; continue }
+      t = t.replace(match, insert)
+    } else {
+      if (!t.includes(oldStr)) { console.log(`[patch] ⚠ 锚点未命中: ${label} · ${name}`); failed += 1; continue }
+      t = t.replace(oldStr, newStr)
+    }
+    changed = true
     patched += 1
     console.log(`[patch] ✓ ${label} · ${name}`)
   }
-  writeFileSync(file, t)
+  if (changed) writeFileSync(file, t)
 }
 
+// ── A. 源码：/api 的 Host 围栏 + 浏览器鉴权（tsx 直接跑 src，这是实际生效的一份）
 patchFile(SRC_RPC, [{
   name: 'requestRejection 内部放行 + off 开关',
-  mark: 'x-dsh-external',
-  oldStr: `  requestRejection(request: ConnectionTrustRequest): ConnectionRequestRejection {
-    if (!isTrustedApiRequest(request, this.trustedHosts)) return 403
-    return this.browserAuth.isAuthenticated(request) ? undefined : 401
-  }`,
-  newStr: `  requestRejection(request: ConnectionTrustRequest): ConnectionRequestRejection {
-    if (process.env.DSH_WEB_AUTH === 'off') return undefined
-    if (!isTrustedApiRequest(request, this.trustedHosts)) return 403
-    if (request.headers['x-dsh-external'] === undefined) return undefined
-    return this.browserAuth.isAuthenticated(request) ? undefined : 401
-  }`,
+  mark: "DSH_WEB_AUTH === 'off'",
+  // 锚点只认函数签名：0.1.x / 0.2.x 相同，函数体重构不影响
+  match: /(requestRejection\(request: ConnectionTrustRequest\): ConnectionRequestRejection \{\r?\n)/,
+  insert: "$1"
+    + "    if (process.env.DSH_WEB_AUTH === 'off') return undefined\n"
+    + "    if (request.headers['x-dsh-external'] === undefined) return undefined\n",
 }], 'A')
 
+// ── B. 源码：BrowserAuth
 patchFile(SRC_AUTH, [
   {
     name: '补充 node:fs/os/path imports',
     mark: "from 'node:fs'",
-    oldStr: `import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
-import { credentialKey } from '@deepseek-ai/dsh-credentials'`,
-    newStr: `import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
-import { credentialKey } from '@deepseek-ai/dsh-credentials'`,
+    // 锚点只认 node:crypto 的 import 行，import 列表变化也能命中
+    match: /(^import [^\n]*from 'node:crypto'\r?\n)/m,
+    insert: "$1"
+      + "import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'\n"
+      + "import { homedir } from 'node:os'\n"
+      + "import { dirname, join } from 'node:path'\n",
   },
   {
     name: 'processLaunchToken 固定（env > 文件 > 内存）',
@@ -90,29 +113,23 @@ import { credentialKey } from '@deepseek-ai/dsh-credentials'`,
   {
     name: 'authorizeIndex off 开关',
     mark: "DSH_WEB_AUTH === 'off'",
-    oldStr: `    /* v8 ignore next -- node:http always supplies url on server requests. */
-    const url = new URL(req.url ?? '/', 'http://dsh.invalid')`,
-    newStr: `    if (process.env.DSH_WEB_AUTH === 'off') return true
-    /* v8 ignore next -- node:http always supplies url on server requests. */
-    const url = new URL(req.url ?? '/', 'http://dsh.invalid')`,
+    // 兼容 0.1.x 与 0.2.x（后者多了 secure = false 参数）
+    match: /(authorizeIndex\(req: ConnectionIndexRequest, res: ConnectionIndexResponse(?:, secure = false)?\): boolean \{\r?\n)/,
+    insert: "$1    if (process.env.DSH_WEB_AUTH === 'off') return true\n",
   },
 ], 'B')
 
+// ── D. 编译产物：与 A 同步（package.json main 指向 lib/index.js，保险起见）
 patchFile(LIB_INDEX, [{
   name: 'lib requestRejection 同步',
-  mark: 'x-dsh-external',
-  oldStr: `	requestRejection(request) {
-		if (!isTrustedApiRequest(request, this.trustedHosts)) return 403;
-		return this.browserAuth.isAuthenticated(request) ? void 0 : 401;
-	}`,
-  newStr: `	requestRejection(request) {
-		if (process.env.DSH_WEB_AUTH === "off") return void 0;
-		if (!isTrustedApiRequest(request, this.trustedHosts)) return 403;
-		if (request.headers["x-dsh-external"] === void 0) return void 0;
-		return this.browserAuth.isAuthenticated(request) ? void 0 : 401;
-	}`,
-}], 'B')
+  mark: 'DSH_WEB_AUTH === "off"',
+  match: /(\t*requestRejection\(request\) \{\r?\n)/,
+  insert: '$1'
+    + '\t\tif (process.env.DSH_WEB_AUTH === "off") return void 0;\n'
+    + '\t\tif (request.headers["x-dsh-external"] === void 0) return void 0;\n',
+}], 'D')
 
+// ── E. 浏览器产物：远程（非 loopback）访问也能读 settings
 patchFile(LIB_CLIENT, [{
   name: 'lib client isLoopback 放宽（远程可读 settings）',
   mark: 'isLoopback: true',
